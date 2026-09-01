@@ -1,0 +1,6 @@
+{
+  "name": "OptoNeuroShifter - AI Visual Neural Pathway Simulation",
+  "description": "Clean clinical research prototype simulating an AI-based alternative pathway for visual information: Environmental visual input, real-time object detection, 2D spatial mapping, and cortical neural encoding.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
