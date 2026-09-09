@@ -1,22 +1,24 @@
 /**
  * BBC micro:bit Web Bluetooth UART Service
  * 
- * Single unified Bluetooth UART connection for both:
- * 1. Sending commands (e.g. 'V\n' for vibration motor)
- * 2. Continuously reading VL53L0X Time-of-Flight distance sensor values (in millimeters)
+ * Uses the Nordic Semiconductor UART Service exposed by MakeCode:
+ * - Service UUID: 6e400001-b5a3-f393-e0a9-e50e24dcca9e
+ * - Write / Write Without Response (Web App -> micro:bit): 6e400003-b5a3-f393-e0a9-e50e24dcca9e (commands e.g. 'V\n')
+ * - Indicate / Notify (micro:bit -> Web App): 6e400002-b5a3-f393-e0a9-e50e24dcca9e (VL53L0X distance in mm)
  */
 
 import { formatDistance } from '../utils/formatDistance';
 
-// Standard Nordic Semiconductor UART Service (MakeCode default BLE UART & Nordic NUS)
-const NORDIC_UART_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
-const NORDIC_UART_RX_CHAR = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'; // Write characteristic (Vibrate 'V\n')
-const NORDIC_UART_TX_CHAR = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; // Notify/Read characteristic (VL53L0X Distance)
+// Nordic Semiconductor UART Service UUIDs
+export const NORDIC_UART_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+// Characteristic 6e400003... has Write / Write Without Response capability on micro:bit
+export const NORDIC_UART_WRITE_CHAR = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; 
+// Characteristic 6e400002... has Indicate / Notify capability on micro:bit
+export const NORDIC_UART_INDICATE_CHAR = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
 
-// Micro:bit Custom Bluetooth UART Service (MakeCode Bluetooth UART extension)
-const MB_UART_SERVICE = 'e95d0753-251d-470a-a062-fa1922dfa9a8';
-const MB_UART_RX_CHAR = 'e95d5404-251d-470a-a062-fa1922dfa9a8'; // Write characteristic
-const MB_UART_TX_CHAR = 'e95d0d2d-251d-470a-a062-fa1922dfa9a8'; // Notify characteristic
+// Keep legacy alias exports for backward-compatibility if imported elsewhere
+export const NORDIC_UART_RX_CHAR = NORDIC_UART_WRITE_CHAR;
+export const NORDIC_UART_TX_CHAR = NORDIC_UART_INDICATE_CHAR;
 
 export interface MicrobitConnectionState {
   isConnected: boolean;
@@ -30,6 +32,9 @@ export interface MicrobitConnectionState {
   lastCommandSent: string | null;
   lastCommandTimestamp: number | null;
   error: string | null;
+  connectionStage?: string;
+  lastCompletedStage?: string | null;
+  currentFailingStage?: string | null;
 }
 
 type StateListener = (state: MicrobitConnectionState) => void;
@@ -55,7 +60,10 @@ class MicrobitBleService {
     lastSensorTimestamp: null,
     lastCommandSent: null,
     lastCommandTimestamp: null,
-    error: null
+    error: null,
+    connectionStage: 'idle',
+    lastCompletedStage: null,
+    currentFailingStage: null
   };
 
   public isBluetoothSupported(): boolean {
@@ -80,184 +88,278 @@ class MicrobitBleService {
   }
 
   /**
-   * Connects to the BBC micro:bit via Web Bluetooth with a 15-second timeout.
-   * Discovers both write (RX) and notify (TX) characteristics from the active UART service.
-   * Reuses this exact same GATT connection for both Vibrate and Distance streaming.
+   * Connects to the BBC micro:bit via Web Bluetooth with a 30-second timeout.
+   * Tracks real-time connection progress across the 5 stages:
+   * - Stage 1: Stage 1 Device Selected
+   * - Stage 2: Stage 2 GATT Connected
+   * - Stage 3: Stage 3 Nordic UART Service Found
+   * - Stage 4: Stage 4 Characteristics Found
+   * - Stage 5: Stage 5 Notifications Started
    */
   public async connect(): Promise<boolean> {
     // If already connected and ready, return immediately
     if (this.state.isConnected && this.server && this.server.connected && this.writeCharacteristic) {
-      this.updateState({ isConnecting: false, error: null });
+      console.log('[BLE] Connection already active and verified.');
+      this.updateState({ 
+        isConnecting: false, 
+        error: null, 
+        connectionStage: 'Connected',
+        lastCompletedStage: 'Stage 5 Notifications Started',
+        currentFailingStage: null
+      });
       return true;
     }
 
     if (this.isConnectingLock) {
+      console.warn('[BLE] Connection attempt already in progress.');
       return false;
     }
 
     if (!this.isBluetoothSupported()) {
+      const err = 'Web Bluetooth is not supported in Safari on iPadOS. Please open this app in Bluefy browser.';
+      console.error(`[BLE Stage 0: Browser Check] ${err}`);
       this.updateState({
         isConnecting: false,
-        error: 'Web Bluetooth is not supported in Safari on iPadOS. Please open this app in Bluefy browser.'
+        error: err,
+        connectionStage: 'unsupported',
+        lastCompletedStage: null,
+        currentFailingStage: 'Browser Web Bluetooth Support Check'
       });
       return false;
     }
 
     this.isConnectingLock = true;
-    this.updateState({ isConnecting: true, error: null });
 
-    // 15-second connection timeout guard
+    // Track active stage state for fine-grained real-time reporting & timeout attribution
+    let lastCompletedStage: string | null = null;
+    let currentExecutingStage: string = 'Stage 1 Device Selection';
+
+    this.updateState({ 
+      isConnecting: true, 
+      error: null, 
+      connectionStage: 'Stage 1: Selecting Device...', 
+      lastCompletedStage: null,
+      currentFailingStage: null 
+    });
+
+    let device: any = null;
+    let selectedDeviceName: string = 'BBC micro:bit';
+
+    try {
+      const navBluetooth = (navigator as any).bluetooth;
+
+      // Stage 1: Device Selection (Invoked directly on user click without timeout wrapper)
+      console.log('[BLE Stage 1/5: Device Selection] Requesting Bluetooth device with acceptAllDevices: true...');
+      
+      device = await navBluetooth.requestDevice({
+        acceptAllDevices: true,
+        optionalServices: ['6e400001-b5a3-f393-e0a9-e50e24dcca9e']
+      });
+
+      if (!device) {
+        throw new Error('No micro:bit device was selected.');
+      }
+
+      // Stage 1 COMPLETED immediately after requestDevice() returns
+      lastCompletedStage = 'Stage 1 Device Selected';
+      selectedDeviceName = device.name || 'BBC micro:bit';
+      console.log(`[BLE Stage 1 COMPLETED: Stage 1 Device Selected] Device: ${selectedDeviceName} (${device.id})`);
+      
+      this.device = device;
+      device.removeEventListener('gattserverdisconnected', this.handleDisconnect.bind(this));
+      device.addEventListener('gattserverdisconnected', this.handleDisconnect.bind(this));
+
+      // Display selected device name in UI and mark Stage 1 completed before starting Stage 2
+      this.updateState({
+        lastCompletedStage: 'Stage 1 Device Selected',
+        deviceName: selectedDeviceName,
+        connectionStage: `Stage 1 Completed: Selected "${selectedDeviceName}". Stage 2: Connecting to GATT Server...`,
+        currentFailingStage: null
+      });
+    } catch (stage1Err: any) {
+      this.isConnectingLock = false;
+      console.warn('[BLE Stage 1 Device Selection Error]', stage1Err);
+
+      const isUserCancel = stage1Err.name === 'NotFoundError' || (stage1Err.message && stage1Err.message.includes('User cancelled'));
+      
+      if (isUserCancel) {
+        this.updateState({
+          isConnected: false,
+          isConnecting: false,
+          error: null,
+          connectionStage: 'idle',
+          currentFailingStage: null
+        });
+        return false;
+      }
+
+      this.updateState({
+        isConnected: false,
+        isConnecting: false,
+        error: `Device selection error: ${stage1Err.message || 'Failed to select device'}. Last successfully completed: "None (failed before device selection)". Failed at: "Stage 1 Device Selection".`,
+        connectionStage: 'failed',
+        lastCompletedStage: null,
+        currentFailingStage: 'Stage 1 Device Selection'
+      });
+      return false;
+    }
+
+    // Start 30-second timeout ONLY after device selection, for Stage 2 GATT connection and onwards
     let connectionTimeout: any = null;
+    let timedOut = false;
+
     const timeoutPromise = new Promise<never>((_, reject) => {
       connectionTimeout = setTimeout(() => {
-        reject(new Error('Connection timed out after 15s. Ensure the micro:bit is powered on and within Bluetooth range.'));
-      }, 15000);
+        timedOut = true;
+        const lastStageText = lastCompletedStage ? `"${lastCompletedStage}"` : 'None';
+        const timeoutErrMsg = `Connection timed out after 30 seconds.\n• Last successfully completed: ${lastStageText}\n• Currently failing at: "${currentExecutingStage}".`;
+        reject(new Error(timeoutErrMsg));
+      }, 30000);
     });
 
     try {
       const connectOperation = async () => {
-        const navBluetooth = (navigator as any).bluetooth;
-
-        // Request Bluetooth device matching micro:bit
-        let device: any = null;
+        // Stage 2: GATT Connection
+        currentExecutingStage = 'Stage 2 GATT Connection';
+        this.updateState({ 
+          connectionStage: 'Stage 2: Connecting to GATT Server...',
+          lastCompletedStage: 'Stage 1 Device Selected',
+          deviceName: selectedDeviceName
+        });
+        console.log('[BLE Stage 2/5: GATT Connection] Connecting to GATT Server...');
+        
+        let server: any = null;
         try {
-          device = await navBluetooth.requestDevice({
-            filters: [
-              { namePrefix: 'BBC micro:bit' },
-              { namePrefix: 'micro:bit' },
-              { namePrefix: 'BBC' }
-            ],
-            optionalServices: [
-              NORDIC_UART_SERVICE,
-              MB_UART_SERVICE,
-              'generic_access',
-              'generic_attribute'
-            ]
-          });
-        } catch (filterErr: any) {
-          if (filterErr.name === 'NotFoundError' || filterErr.message?.includes('User cancelled')) {
-            throw filterErr;
+          server = await device.gatt.connect();
+          this.server = server;
+        } catch (gattErr: any) {
+          console.error('[BLE Stage 2/5: GATT Connection Failed]', gattErr);
+          throw new Error(`GATT Server connection failed: ${gattErr.message || 'Could not establish connection'}`);
+        }
+
+        // Stage 2 COMPLETED
+        lastCompletedStage = 'Stage 2 GATT Connected';
+        console.log('[BLE Stage 2 COMPLETED: Stage 2 GATT Connected] Connected to micro:bit GATT Server.');
+
+        // Stage 3: Nordic UART Service Discovery
+        currentExecutingStage = 'Stage 3 Nordic UART Service Discovery';
+        this.updateState({ 
+          connectionStage: 'Stage 3: Discovering Nordic UART Service...',
+          lastCompletedStage: 'Stage 2 GATT Connected'
+        });
+        console.log(`[BLE Stage 3/5: Service Discovery] Querying Nordic UART Service (${NORDIC_UART_SERVICE})...`);
+        
+        let service: any = null;
+        try {
+          service = await server.getPrimaryService(NORDIC_UART_SERVICE);
+          if (!service) {
+            throw new Error(`Nordic UART Service (${NORDIC_UART_SERVICE}) not returned.`);
           }
-          // Fallback to acceptAllDevices
-          console.warn('Filtered requestDevice failed, falling back to acceptAllDevices:', filterErr);
-          device = await navBluetooth.requestDevice({
-            acceptAllDevices: true,
-            optionalServices: [
-              NORDIC_UART_SERVICE,
-              MB_UART_SERVICE,
-              'generic_access'
-            ]
-          });
+        } catch (servErr: any) {
+          console.error('[BLE Stage 3/5: Service Discovery Failed]', servErr);
+          throw new Error(`Nordic UART Service (${NORDIC_UART_SERVICE}) not found. Ensure MakeCode firmware has bluetooth.startUartService().`);
         }
 
-        if (!device) {
-          throw new Error('No micro:bit device was selected.');
-        }
+        // Stage 3 COMPLETED
+        lastCompletedStage = 'Stage 3 Nordic UART Service Found';
+        console.log('[BLE Stage 3 COMPLETED: Stage 3 Nordic UART Service Found] Primary service acquired.');
 
-        this.device = device;
-        device.removeEventListener('gattserverdisconnected', this.handleDisconnect.bind(this));
-        device.addEventListener('gattserverdisconnected', this.handleDisconnect.bind(this));
-
-        // Connect GATT Server
-        console.log('Connecting to GATT Server on micro:bit...');
-        const server = await device.gatt.connect();
-        this.server = server;
-
+        // Stage 4: Characteristic Discovery & Capability Mapping
+        currentExecutingStage = 'Stage 4 Characteristic Discovery';
+        this.updateState({ 
+          connectionStage: 'Stage 4: Finding Characteristics...',
+          lastCompletedStage: 'Stage 3 Nordic UART Service Found'
+        });
+        console.log('[BLE Stage 4/5: Characteristic Discovery] Inspecting GATT characteristics...');
+        
         let writeChar: any = null;
-        let notifyChar: any = null;
+        let indicateChar: any = null;
 
-        // 1. Try Nordic UART Service first
         try {
-          const service = await server.getPrimaryService(NORDIC_UART_SERVICE);
-          if (service) {
-            try {
-              writeChar = await service.getCharacteristic(NORDIC_UART_RX_CHAR);
-            } catch (rxErr) {
-              console.warn('Nordic RX characteristic search:', rxErr);
+          const characteristics = await service.getCharacteristics();
+          console.log(`[BLE Stage 4/5: Characteristic Discovery] Discovered ${characteristics.length} characteristics:`);
+
+          for (const char of characteristics) {
+            const uuid = char.uuid.toLowerCase();
+            const props = char.properties || {};
+            console.log(`  - UUID: ${uuid} | [read: ${!!props.read}, write: ${!!props.write}, writeWithoutResponse: ${!!props.writeWithoutResponse}, notify: ${!!props.notify}, indicate: ${!!props.indicate}]`);
+
+            // Capability-based detection:
+            // Check write capability (write or writeWithoutResponse)
+            if (props.write || props.writeWithoutResponse || uuid.includes('6e400003')) {
+              if (!writeChar || uuid.includes('6e400003')) {
+                writeChar = char;
+                console.log(`    -> Assigned as WRITE characteristic (UUID: ${uuid})`);
+              }
             }
-            try {
-              notifyChar = await service.getCharacteristic(NORDIC_UART_TX_CHAR);
-            } catch (txErr) {
-              console.warn('Nordic TX characteristic search:', txErr);
+
+            // Check indication/notification capability (indicate or notify)
+            if (props.indicate || props.notify || uuid.includes('6e400002')) {
+              if (!indicateChar || uuid.includes('6e400002')) {
+                indicateChar = char;
+                console.log(`    -> Assigned as INDICATE/NOTIFY characteristic (UUID: ${uuid})`);
+              }
             }
           }
-        } catch (nordicErr) {
-          console.warn('Nordic primary service lookup:', nordicErr);
-        }
-
-        // 2. Try micro:bit Custom UART Service if not found
-        if (!writeChar && !notifyChar) {
+        } catch (getCharsErr: any) {
+          console.warn('[BLE Stage 4: Characteristic Discovery] getCharacteristics failed, trying direct lookup:', getCharsErr);
           try {
-            const mbService = await server.getPrimaryService(MB_UART_SERVICE);
-            if (mbService) {
-              try {
-                writeChar = await mbService.getCharacteristic(MB_UART_RX_CHAR);
-              } catch (rxErr) {
-                console.warn('micro:bit RX characteristic search:', rxErr);
-              }
-              try {
-                notifyChar = await mbService.getCharacteristic(MB_UART_TX_CHAR);
-              } catch (txErr) {
-                console.warn('micro:bit TX characteristic search:', txErr);
-              }
-            }
-          } catch (mbErr) {
-            console.warn('micro:bit custom UART service lookup:', mbErr);
+            writeChar = await service.getCharacteristic(NORDIC_UART_WRITE_CHAR);
+          } catch (wErr) {
+            console.warn(`  -> Lookup write char (${NORDIC_UART_WRITE_CHAR}) failed:`, wErr);
           }
-        }
 
-        // 3. Fallback: inspect all services on GATT server
-        if (!writeChar && !notifyChar && server.getPrimaryServices) {
           try {
-            const services = await server.getPrimaryServices();
-            for (const s of services) {
-              try {
-                const chars = await s.getCharacteristics();
-                for (const c of chars) {
-                  const uuid = c.uuid.toLowerCase();
-                  if (uuid.includes('6e400002') || uuid.includes('5404') || c.properties?.write || c.properties?.writeWithoutResponse) {
-                    if (!writeChar) writeChar = c;
-                  }
-                  if (uuid.includes('6e400003') || uuid.includes('0d2d') || c.properties?.notify || c.properties?.indicate) {
-                    if (!notifyChar) notifyChar = c;
-                  }
-                }
-              } catch (charErr) {
-                // Ignore service inspection errors
-              }
-            }
-          } catch (servErr) {
-            console.warn('Error querying all primary services:', servErr);
+            indicateChar = await service.getCharacteristic(NORDIC_UART_INDICATE_CHAR);
+          } catch (iErr) {
+            console.warn(`  -> Lookup indicate char (${NORDIC_UART_INDICATE_CHAR}) failed:`, iErr);
           }
         }
 
-        if (!writeChar && !notifyChar) {
-          throw new Error('Connected to micro:bit, but UART characteristics were not found. Please verify the MakeCode Bluetooth UART code is flashed.');
+        if (!writeChar && !indicateChar) {
+          throw new Error('Neither write nor notify UART characteristics were found in Nordic UART service.');
         }
 
         this.writeCharacteristic = writeChar;
-        this.notifyCharacteristic = notifyChar;
+        this.notifyCharacteristic = indicateChar;
 
-        // Set connected state immediately so Vibrate works without delay
+        // Stage 4 COMPLETED
+        lastCompletedStage = 'Stage 4 Characteristics Found';
+        console.log('[BLE Stage 4 COMPLETED: Stage 4 Characteristics Found] Write & Indicate characteristics mapped.');
+
+        // Stage 5: Notification / Indication Subscription
+        currentExecutingStage = 'Stage 5 Notification Subscription';
+        this.updateState({ 
+          connectionStage: 'Stage 5: Starting Notifications...',
+          lastCompletedStage: 'Stage 4 Characteristics Found'
+        });
+        console.log('[BLE Stage 5/5: Notification Subscription] Subscribing to incoming UART indications/notifications...');
+
+        if (indicateChar) {
+          try {
+            await indicateChar.startNotifications();
+            indicateChar.removeEventListener('characteristicvaluechanged', this.handleIncomingUartData.bind(this));
+            indicateChar.addEventListener('characteristicvaluechanged', this.handleIncomingUartData.bind(this));
+            console.log('[BLE Stage 5 COMPLETED: Stage 5 Notifications Started] Subscribed to VL53L0X distance stream.');
+          } catch (subErr: any) {
+            console.warn('[BLE Stage 5 Warning] Indication start error (write capability remains active):', subErr);
+          }
+        }
+
+        // Stage 5 COMPLETED
+        lastCompletedStage = 'Stage 5 Notifications Started';
+        currentExecutingStage = 'Connected';
+
+        console.log(`[BLE Connection Complete] Connected to ${selectedDeviceName}. All 5 stages succeeded.`);
         this.updateState({
           isConnected: true,
           isConnecting: false,
-          deviceName: device.name || 'BBC micro:bit',
-          error: null
+          deviceName: selectedDeviceName,
+          error: null,
+          connectionStage: 'Connected',
+          lastCompletedStage: 'Stage 5 Notifications Started',
+          currentFailingStage: null
         });
-
-        // Asynchronously start notifications on TX characteristic (does not block Vibrate)
-        if (notifyChar && (notifyChar.properties?.notify || notifyChar.properties?.indicate)) {
-          notifyChar.startNotifications()
-            .then(() => {
-              notifyChar.removeEventListener('characteristicvaluechanged', this.handleIncomingUartData.bind(this));
-              notifyChar.addEventListener('characteristicvaluechanged', this.handleIncomingUartData.bind(this));
-              console.log('VL53L0X UART distance notifications successfully started.');
-            })
-            .catch((notifErr: any) => {
-              console.warn('Note: TX notifications failed to start (vibrate write remains fully operational):', notifErr);
-            });
-        }
 
         return true;
       };
@@ -269,13 +371,39 @@ class MicrobitBleService {
     } catch (err: any) {
       clearTimeout(connectionTimeout);
       this.isConnectingLock = false;
-      console.warn('Bluetooth connection error:', err);
+      console.warn('[BLE Connection Error]', err);
 
       const isUserCancel = err.name === 'NotFoundError' || (err.message && err.message.includes('User cancelled'));
+      
+      if (isUserCancel) {
+        this.updateState({
+          isConnected: false,
+          isConnecting: false,
+          error: null,
+          connectionStage: 'idle',
+          currentFailingStage: null
+        });
+        return false;
+      }
+
+      // Construct explicit error message with last completed stage and currently failing stage
+      const lastDoneText = lastCompletedStage ? lastCompletedStage : 'None (failed before device selection)';
+      const failingText = currentExecutingStage;
+      
+      let detailedErrorMessage = '';
+      if (timedOut || err.message?.includes('timed out')) {
+        detailedErrorMessage = `Connection timed out after 30 seconds. Last successfully completed: "${lastDoneText}". Currently failing at: "${failingText}".`;
+      } else {
+        detailedErrorMessage = `${err.message || 'Connection error'}. Last successfully completed: "${lastDoneText}". Failed at: "${failingText}".`;
+      }
+
       this.updateState({
         isConnected: false,
         isConnecting: false,
-        error: isUserCancel ? null : (err.message || 'Failed to connect to micro:bit')
+        error: detailedErrorMessage,
+        connectionStage: 'failed',
+        lastCompletedStage,
+        currentFailingStage: failingText
       });
       return false;
     }
@@ -324,7 +452,7 @@ class MicrobitBleService {
         }
       }
     } catch (parseErr) {
-      console.warn('Error parsing micro:bit UART packet:', parseErr);
+      console.warn('[BLE UART Parser Error]', parseErr);
     }
   }
 
@@ -332,6 +460,7 @@ class MicrobitBleService {
    * Disconnect from the micro:bit
    */
   public disconnect() {
+    console.log('[BLE] Disconnecting from micro:bit...');
     if (this.notifyCharacteristic) {
       try {
         this.notifyCharacteristic.removeEventListener('characteristicvaluechanged', this.handleIncomingUartData.bind(this));
@@ -351,6 +480,7 @@ class MicrobitBleService {
   }
 
   private handleDisconnect() {
+    console.log('[BLE] Connection terminated / GATT disconnected.');
     this.writeCharacteristic = null;
     this.notifyCharacteristic = null;
     this.server = null;
@@ -360,19 +490,22 @@ class MicrobitBleService {
       isConnected: false,
       isConnecting: false,
       deviceName: null,
-      isLiveSensorActive: false
+      isLiveSensorActive: false,
+      connectionStage: 'disconnected'
     });
   }
 
   /**
-   * Sends raw string command to the micro:bit UART (reusing the same connection)
+   * Sends raw string command to the micro:bit UART write characteristic (6e400003...)
    * @param command Command string to send (e.g. "V\n")
    */
   public async sendCommand(command: string): Promise<boolean> {
     // If not connected, attempt connection first
     if (!this.state.isConnected || !this.writeCharacteristic || !this.server?.connected) {
+      console.log('[BLE Command] Not connected. Attempting connection first...');
       const connected = await this.connect();
       if (!connected || !this.writeCharacteristic) {
+        console.error('[BLE Command] Connection failed, cannot transmit command.');
         return false;
       }
     }
@@ -384,32 +517,38 @@ class MicrobitBleService {
       let writeSuccess = false;
       let lastError: any = null;
 
-      // 1. Try standard writeValue (widely supported across Web Bluetooth & Bluefy)
-      if (this.writeCharacteristic.writeValue) {
+      // 1. Try writeValueWithoutResponse if supported (preferred for fast command transfer)
+      if (this.writeCharacteristic.writeValueWithoutResponse) {
         try {
-          await this.writeCharacteristic.writeValue(data);
+          await this.writeCharacteristic.writeValueWithoutResponse(data);
           writeSuccess = true;
+          console.log(`[BLE Command Sent via writeValueWithoutResponse]: "${command.replace('\n', '\\n')}"`);
         } catch (err1) {
+          console.warn('[BLE writeValueWithoutResponse failed, trying standard writeValue]:', err1);
           lastError = err1;
         }
       }
 
-      // 2. Try writeValueWithoutResponse if not written
-      if (!writeSuccess && this.writeCharacteristic.writeValueWithoutResponse) {
+      // 2. Try standard writeValue if not already sent
+      if (!writeSuccess && this.writeCharacteristic.writeValue) {
         try {
-          await this.writeCharacteristic.writeValueWithoutResponse(data);
+          await this.writeCharacteristic.writeValue(data);
           writeSuccess = true;
+          console.log(`[BLE Command Sent via writeValue]: "${command.replace('\n', '\\n')}"`);
         } catch (err2) {
+          console.warn('[BLE writeValue failed, trying writeValueWithResponse]:', err2);
           lastError = err2;
         }
       }
 
-      // 3. Try writeValueWithResponse if not written
+      // 3. Try writeValueWithResponse if available and still not sent
       if (!writeSuccess && this.writeCharacteristic.writeValueWithResponse) {
         try {
           await this.writeCharacteristic.writeValueWithResponse(data);
           writeSuccess = true;
+          console.log(`[BLE Command Sent via writeValueWithResponse]: "${command.replace('\n', '\\n')}"`);
         } catch (err3) {
+          console.warn('[BLE writeValueWithResponse failed]:', err3);
           lastError = err3;
         }
       }
@@ -426,7 +565,7 @@ class MicrobitBleService {
 
       return true;
     } catch (err: any) {
-      console.error('Failed to send UART command to micro:bit:', err);
+      console.error('[BLE Command Send Failure]:', err);
       this.updateState({
         error: `Failed to transmit command: ${err.message || 'UART write error'}`
       });
