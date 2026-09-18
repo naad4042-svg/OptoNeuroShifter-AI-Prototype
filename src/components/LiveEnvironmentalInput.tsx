@@ -23,6 +23,7 @@ interface LiveEnvironmentalInputProps {
   currentScenario: ClinicalBenchmarkScenario;
   detectedEntities: DetectedEntity[];
   isWebcamActive: boolean;
+  onToggleWebcam?: () => void;
   selectedEntityId: string | null;
   onSelectEntity: (id: string | null) => void;
   videoRef: React.RefObject<HTMLVideoElement | null>;
@@ -41,6 +42,7 @@ export const LiveEnvironmentalInput: React.FC<LiveEnvironmentalInputProps> = ({
   currentScenario,
   detectedEntities,
   isWebcamActive,
+  onToggleWebcam,
   selectedEntityId,
   onSelectEntity,
   videoRef,
@@ -56,6 +58,38 @@ export const LiveEnvironmentalInput: React.FC<LiveEnvironmentalInputProps> = ({
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const [showSettings, setShowSettings] = useState(false);
+  const [videoBounds, setVideoBounds] = useState<{ left: number; top: number; width: number; height: number } | null>(null);
+
+  // Compute exact displayed video rectangle inside the container so bounding boxes land pixel-perfectly
+  useEffect(() => {
+    const updateBounds = () => {
+      if (!containerRef.current || !videoRef.current || !isWebcamActive) {
+        setVideoBounds(null);
+        return;
+      }
+      const cW = containerRef.current.clientWidth;
+      const cH = containerRef.current.clientHeight;
+      const vW = videoRef.current.videoWidth || 640;
+      const vH = videoRef.current.videoHeight || 480;
+      if (!cW || !cH || !vW || !vH) return;
+
+      const scale = Math.max(cW / vW, cH / vH);
+      const renderedW = vW * scale;
+      const renderedH = vH * scale;
+      const offsetX = (cW - renderedW) / 2;
+      const offsetY = (cH - renderedH) / 2;
+
+      setVideoBounds({ left: offsetX, top: offsetY, width: renderedW, height: renderedH });
+    };
+
+    updateBounds();
+    const interval = setInterval(updateBounds, 600);
+    window.addEventListener('resize', updateBounds);
+    return () => {
+      clearInterval(interval);
+      window.removeEventListener('resize', updateBounds);
+    };
+  }, [isWebcamActive]);
 
   // Category badge color lookup
   const getCategoryColor = (category: string) => {
@@ -102,16 +136,17 @@ export const LiveEnvironmentalInput: React.FC<LiveEnvironmentalInputProps> = ({
 
         {/* Action Pills */}
         <div className="flex items-center gap-2">
-          {bleState.isLiveSensorActive ? (
+          {bleState.isLiveSensorActive && (
             <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-md text-[11px] font-bold bg-emerald-50 text-emerald-800 border border-emerald-300">
               <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
               Live VL53L0X: {bleState.sensorDistanceFormatted}
             </span>
-          ) : (
-            <span className="inline-flex items-center px-2 py-0.5 rounded-md text-[11px] font-semibold bg-blue-50 text-blue-700 border border-blue-200">
-              {detectedEntities.length} Targets Isolated
-            </span>
           )}
+
+          <span className="inline-flex items-center px-2.5 py-0.5 rounded-md text-[11px] font-semibold bg-blue-50 text-blue-700 border border-blue-200">
+            <span className="w-1.5 h-1.5 rounded-full bg-blue-500 mr-1.5"></span>
+            {detectedEntities.length} {detectedEntities.length === 1 ? 'Target Isolated' : 'Targets Isolated'}
+          </span>
 
           <button
             id="toggle-input-settings-btn"
@@ -207,7 +242,20 @@ export const LiveEnvironmentalInput: React.FC<LiveEnvironmentalInputProps> = ({
         )}
 
         {/* Real-time Object Detection Bounding Boxes Overlay */}
-        <div className="absolute inset-0 pointer-events-none">
+        <div 
+          className="absolute pointer-events-none"
+          style={videoBounds ? {
+            left: `${videoBounds.left}px`,
+            top: `${videoBounds.top}px`,
+            width: `${videoBounds.width}px`,
+            height: `${videoBounds.height}px`
+          } : {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0
+          }}
+        >
           {detectedEntities.map((entity) => {
             const isSelected = selectedEntityId === entity.id;
             const leftPct = `${entity.bbox.x * 100}%`;
@@ -266,7 +314,13 @@ export const LiveEnvironmentalInput: React.FC<LiveEnvironmentalInputProps> = ({
                 {/* Direction & Movement indicator */}
                 {showVectors && entity.movement !== 'stationary' && (
                   <div className="absolute bottom-1 right-1 px-1.5 py-0.5 rounded text-[9px] font-mono font-bold bg-purple-900/90 text-purple-200 border border-purple-400/40">
-                    {entity.movement === 'approaching' ? '▼ Approaching' : entity.movement === 'receding' ? '▲ Receding' : '► Lateral'}
+                    {entity.movement === 'approaching' 
+                      ? '▼ Approaching' 
+                      : entity.movement === 'receding' 
+                        ? '▲ Receding' 
+                        : entity.movement === 'crossing-left'
+                          ? '◄ Cross Left'
+                          : '► Cross Right'}
                   </div>
                 )}
               </div>
@@ -274,13 +328,55 @@ export const LiveEnvironmentalInput: React.FC<LiveEnvironmentalInputProps> = ({
           })}
         </div>
 
+        {/* Dynamic Scanning State when live camera is scanning and 0 targets detected */}
+        {isWebcamActive && detectedEntities.length === 0 && !cameraError && (
+          <div className="absolute inset-0 pointer-events-none flex flex-col items-center justify-center p-4">
+            <div className="border border-sky-400/30 rounded-2xl p-5 flex flex-col items-center bg-slate-950/40 backdrop-blur-[2px] shadow-xl text-center">
+              <Scan className="w-9 h-9 text-sky-400 animate-pulse mb-2.5" />
+              <div className="text-xs font-mono font-bold text-sky-200 uppercase tracking-wider">Aperture Active • 0 Targets Isolated</div>
+              <div className="text-[11px] text-slate-300 mt-1 max-w-xs">
+                Scanning live camera feed in real time. Point camera at people, laptops, cups, chairs, or objects.
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Standby State when camera is inactive */}
+        {!isWebcamActive && (
+          <div className="absolute inset-0 bg-slate-950/85 flex flex-col items-center justify-center p-6 text-center text-white z-10">
+            <Camera className="w-12 h-12 text-blue-400 mb-3" />
+            <h4 className="text-sm font-bold text-slate-100">Live Camera Ingestion Standby</h4>
+            <p className="text-xs text-slate-400 mt-1 max-w-sm">
+              Activate your device camera to detect objects dynamically from the real-time optical video feed.
+            </p>
+            {onToggleWebcam && (
+              <button
+                id="start-live-camera-feed-btn"
+                onClick={onToggleWebcam}
+                className="mt-4 px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-xs font-bold shadow-lg flex items-center gap-2 cursor-pointer transition-all"
+              >
+                <Camera className="w-4 h-4" />
+                <span>Start Live Camera Feed</span>
+              </button>
+            )}
+          </div>
+        )}
+
         {/* Camera Permission / Error Warning */}
-        {cameraError && isWebcamActive && (
-          <div className="absolute inset-0 bg-slate-900/90 flex flex-col items-center justify-center p-6 text-center text-white">
+        {cameraError && (
+          <div className="absolute inset-0 bg-slate-900/95 flex flex-col items-center justify-center p-6 text-center text-white z-20">
             <AlertCircle className="w-10 h-10 text-amber-400 mb-2" />
             <h4 className="text-sm font-bold">Camera Access Notification</h4>
             <p className="text-xs text-slate-300 mt-1 max-w-sm">{cameraError}</p>
-            <p className="text-[11px] text-blue-300 mt-3">Reverting to high-precision synthetic clinical scenario stream.</p>
+            {onToggleWebcam && (
+              <button
+                id="retry-camera-btn"
+                onClick={onToggleWebcam}
+                className="mt-4 px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-xs font-bold cursor-pointer transition-all"
+              >
+                Allow / Retry Camera Access
+              </button>
+            )}
           </div>
         )}
 

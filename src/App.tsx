@@ -32,7 +32,7 @@ import { microbitBleService, MicrobitConnectionState } from './services/microbit
 export default function App() {
   // Scenario & Source State
   const [currentScenario, setCurrentScenario] = useState<ClinicalBenchmarkScenario>(CLINICAL_SCENARIOS[0]);
-  const [isWebcamActive, setIsWebcamActive] = useState<boolean>(false);
+  const [isWebcamActive, setIsWebcamActive] = useState<boolean>(true);
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [isAudioActive, setIsAudioActive] = useState<boolean>(false);
   const [isRunning, setIsRunning] = useState<boolean>(true);
@@ -40,23 +40,23 @@ export default function App() {
   // micro:bit Bluetooth & VL53L0X state
   const [bleState, setBleState] = useState<MicrobitConnectionState>(microbitBleService.getState());
 
-  // Entities & Processing State
-  const [detectedEntities, setDetectedEntities] = useState<DetectedEntity[]>(currentScenario.entities);
+  // Entities & Processing State (Dynamically populated from live camera; no fixed 4 targets)
+  const [detectedEntities, setDetectedEntities] = useState<DetectedEntity[]>([]);
   const [spatialMapData, setSpatialMapData] = useState<SpatialMapData>(() => 
-    SpatialMapperService.generateSpatialMap(currentScenario.entities)
+    SpatialMapperService.generateSpatialMap([])
   );
   
   // Neural Simulation State
   const [gridSize, setGridSize] = useState<16 | 24 | 32>(16);
   const [neuralProtocol, setNeuralProtocol] = useState<NeuralEncodingProtocol>('retinotopic_v1');
   const [neuralState, setNeuralState] = useState<NeuralSimulationState>(() => 
-    NeuralEncoderService.generateCorticalGrid(16, 'retinotopic_v1', currentScenario.entities, 0)
+    NeuralEncoderService.generateCorticalGrid(16, 'retinotopic_v1', [], 0)
   );
 
   // Interaction State
   const [selectedEntityId, setSelectedEntityId] = useState<string | null>(null);
   const [selectedElectrodeId, setSelectedElectrodeId] = useState<number | null>(null);
-  const [minConfidence, setMinConfidence] = useState<number>(0.65);
+  const [minConfidence, setMinConfidence] = useState<number>(0.45);
   const [showDepthOverlay, setShowDepthOverlay] = useState<boolean>(false);
   const [showVectors, setShowVectors] = useState<boolean>(true);
 
@@ -94,8 +94,52 @@ export default function App() {
     return () => unsubscribe();
   }, []);
 
+  // Auto-start webcam on mount for live environmental input
+  useEffect(() => {
+    let isMounted = true;
+    const startCamera = async () => {
+      try {
+        setCameraError(null);
+        DetectionEngineService.loadCocoModel();
+        if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+          const stream = await navigator.mediaDevices.getUserMedia({
+            video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'environment' }
+          });
+          if (!isMounted) {
+            stream.getTracks().forEach(t => t.stop());
+            return;
+          }
+          webcamStreamRef.current = stream;
+          if (videoRef.current) {
+            videoRef.current.srcObject = stream;
+            videoRef.current.onloadedmetadata = () => {
+              videoRef.current?.play().catch(e => console.warn('Camera autoplay notice:', e));
+            };
+          }
+          setIsWebcamActive(true);
+        }
+      } catch (err: any) {
+        console.warn('Live camera auto-start notice (user activation required):', err);
+        setIsWebcamActive(false);
+        setCameraError(err.name === 'NotAllowedError' ? 'Camera access permission denied. Click "Start Live Camera" to enable.' : null);
+      }
+    };
+
+    startCamera();
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
   // Handle Scenario Change
   const handleSelectScenario = (scenario: ClinicalBenchmarkScenario) => {
+    if (isWebcamActive && webcamStreamRef.current) {
+      webcamStreamRef.current.getTracks().forEach(t => t.stop());
+      webcamStreamRef.current = null;
+      if (videoRef.current) videoRef.current.srcObject = null;
+      setIsWebcamActive(false);
+    }
     setCurrentScenario(scenario);
     let entities = scenario.entities;
     if (bleState.isLiveSensorActive && bleState.sensorDistanceMeters !== null) {
@@ -122,11 +166,14 @@ export default function App() {
       }
       setIsWebcamActive(false);
       setCameraError(null);
-      handleSelectScenario(currentScenario);
+      setDetectedEntities([]);
+      setSpatialMapData(SpatialMapperService.generateSpatialMap([]));
+      setNeuralState(NeuralEncoderService.generateCorticalGrid(gridSize, neuralProtocol, [], pulsePhaseRef.current));
     } else {
       // Start webcam
       try {
         setCameraError(null);
+        setDetectedEntities([]);
         const stream = await navigator.mediaDevices.getUserMedia({
           video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'environment' }
         });
@@ -134,15 +181,14 @@ export default function App() {
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
           videoRef.current.onloadedmetadata = () => {
-            videoRef.current?.play();
+            videoRef.current?.play().catch(e => console.warn('Camera play notice:', e));
           };
         }
         setIsWebcamActive(true);
-        // Preload COCO model
         DetectionEngineService.loadCocoModel();
       } catch (err: any) {
         console.error('Camera access error:', err);
-        setCameraError('Unable to open camera hardware. Using synthetic clinical stream.');
+        setCameraError('Unable to access device camera. Check permissions in browser settings.');
         setIsWebcamActive(false);
       }
     }
@@ -177,11 +223,10 @@ export default function App() {
       let currentEntities: DetectedEntity[] = [];
 
       if (isWebcamActive && videoRef.current && videoRef.current.readyState >= 2) {
-        // Live Webcam Inference
-        const detected = await DetectionEngineService.detectFrame(videoRef.current, minConfidence);
-        currentEntities = detected.length > 0 ? detected : detectedEntities;
-      } else if (canvasRef.current) {
-        // High-precision Synthetic Scenario Animation
+        // Fully dynamic live camera inference: detects only objects actually visible
+        currentEntities = await DetectionEngineService.detectFrame(videoRef.current, minConfidence);
+      } else if (!isWebcamActive && canvasRef.current) {
+        // Synthetic Scenario Animation only when webcam is deliberately deactivated
         currentEntities = DetectionEngineService.drawScenarioFrame(
           canvasRef.current,
           currentScenario,
@@ -189,57 +234,61 @@ export default function App() {
         );
       }
 
-      if (currentEntities.length > 0) {
-        // If micro:bit VL53L0X distance sensor is active, replace estimated distance with real sensor value
-        if (bleState.isLiveSensorActive && bleState.sensorDistanceMeters !== null) {
-          currentEntities = SpatialMapperService.applyLiveSensorDistance(
-            currentEntities,
-            bleState.sensorDistanceMeters,
-            selectedEntityId
-          );
-        }
-
-        setDetectedEntities(currentEntities);
-
-        // Compute Spatial Map
-        const spatial = SpatialMapperService.generateSpatialMap(currentEntities);
-        setSpatialMapData(spatial);
-
-        // Compute Neural Retinotopic Encoding Grid
-        const neural = NeuralEncoderService.generateCorticalGrid(
-          gridSize,
-          neuralProtocol,
+      // If micro:bit VL53L0X distance sensor is active, replace estimated distance with real sensor value
+      if (bleState.isLiveSensorActive && bleState.sensorDistanceMeters !== null && currentEntities.length > 0) {
+        currentEntities = SpatialMapperService.applyLiveSensorDistance(
           currentEntities,
-          pulsePhaseRef.current
+          bleState.sensorDistanceMeters,
+          selectedEntityId
         );
-        setNeuralState(neural);
-
-        // Trigger Audio Cues if active
-        if (isAudioActive) {
-          const nearest = currentEntities.reduce((prev, curr) => 
-            curr.distanceMeters < prev.distanceMeters ? curr : prev, currentEntities[0]
-          );
-          if (nearest && nearest.distanceMeters < 4.0) {
-            SpatialAudioService.playProximityCue(
-              nearest.distanceMeters, 
-              nearest.azimuthDegrees, 
-              nearest.hazardLevel === 'critical'
-            );
-          }
-        }
-
-        // Update telemetry counters
-        setTelemetry(prev => ({
-          ...prev,
-          inputFps: calculatedFps,
-          framesProcessed: prev.framesProcessed + 1,
-          totalPipelineLatencyMs: 22 + Math.floor(Math.sin(time * 0.005) * 3)
-        }));
       }
+
+      // Dynamic update of isolated targets
+      setDetectedEntities(currentEntities);
+
+      // Section B dynamic update: Compute Spatial Map
+      const spatial = SpatialMapperService.generateSpatialMap(currentEntities);
+      setSpatialMapData(spatial);
+
+      // Compute Neural Retinotopic Encoding Grid
+      const neural = NeuralEncoderService.generateCorticalGrid(
+        gridSize,
+        neuralProtocol,
+        currentEntities,
+        pulsePhaseRef.current
+      );
+      setNeuralState(neural);
+
+      // Deselect if target left view
+      if (selectedEntityId && !currentEntities.some(e => e.id === selectedEntityId)) {
+        setSelectedEntityId(null);
+      }
+
+      // Trigger Audio Cues if active
+      if (isAudioActive && currentEntities.length > 0) {
+        const nearest = currentEntities.reduce((prev, curr) => 
+          curr.distanceMeters < prev.distanceMeters ? curr : prev, currentEntities[0]
+        );
+        if (nearest && nearest.distanceMeters < 4.0) {
+          SpatialAudioService.playProximityCue(
+            nearest.distanceMeters, 
+            nearest.azimuthDegrees, 
+            nearest.hazardLevel === 'critical'
+          );
+        }
+      }
+
+      // Update telemetry counters
+      setTelemetry(prev => ({
+        ...prev,
+        inputFps: calculatedFps,
+        framesProcessed: prev.framesProcessed + 1,
+        totalPipelineLatencyMs: 22 + Math.floor(Math.sin(time * 0.005) * 3)
+      }));
     }
 
     animationFrameId.current = requestAnimationFrame(runSimulationTick);
-  }, [isRunning, isWebcamActive, currentScenario, minConfidence, gridSize, neuralProtocol, isAudioActive, detectedEntities, bleState, selectedEntityId]);
+  }, [isRunning, isWebcamActive, currentScenario, minConfidence, gridSize, neuralProtocol, isAudioActive, bleState, selectedEntityId]);
 
   useEffect(() => {
     animationFrameId.current = requestAnimationFrame(runSimulationTick);
@@ -283,6 +332,7 @@ export default function App() {
               currentScenario={currentScenario}
               detectedEntities={detectedEntities}
               isWebcamActive={isWebcamActive}
+              onToggleWebcam={handleToggleWebcam}
               selectedEntityId={selectedEntityId}
               onSelectEntity={setSelectedEntityId}
               videoRef={videoRef}

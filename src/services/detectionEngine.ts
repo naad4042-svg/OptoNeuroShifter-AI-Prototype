@@ -12,6 +12,23 @@ export class DetectionEngineService {
   private static cocoModel: any = null;
   private static isLoadingModel = false;
   private static modelLoadPromise: Promise<any> | null = null;
+  private static nextTrackId = 1;
+  private static trackedEntities = new Map<string, {
+    id: string;
+    label: string;
+    category: ObjectCategory;
+    prevBbox: BoundingBox;
+    prevDist: number;
+    lastTime: number;
+    velocityMps: number;
+    movement: MovementType;
+  }>();
+
+  // Offscreen canvas for fast optical frame analysis
+  private static offscreenCanvas: HTMLCanvasElement | null = null;
+  private static offscreenCtx: CanvasRenderingContext2D | null = null;
+  private static prevFrameData: Uint8ClampedArray | null = null;
+  private static lastOpticalCheckTime = 0;
 
   /**
    * Lazy load the browser-compatible TensorFlow.js Coco-SSD model
@@ -23,7 +40,6 @@ export class DetectionEngineService {
     this.isLoadingModel = true;
     this.modelLoadPromise = (async () => {
       try {
-        // Dynamically import tfjs and coco-ssd to keep bundle fast
         const tf = await import('@tensorflow/tfjs');
         await tf.ready();
         const cocoSsd = await import('@tensorflow-models/coco-ssd');
@@ -31,7 +47,7 @@ export class DetectionEngineService {
         this.isLoadingModel = false;
         return this.cocoModel;
       } catch (err: any) {
-        console.warn('Coco-SSD loading notice: Using high-speed vision detection pipeline.', err);
+        console.warn('Coco-SSD loading note: Optical vision analyzer ready as active fallback.', err);
         this.isLoadingModel = false;
         return null;
       }
@@ -41,57 +57,174 @@ export class DetectionEngineService {
   }
 
   /**
-   * Run real-time detection on a video or canvas element
+   * Run real-time dynamic detection on a video or canvas element.
+   * Detects only the objects actually visible in the camera.
    */
   public static async detectFrame(
     sourceElement: HTMLVideoElement | HTMLCanvasElement,
-    minConfidence = 0.5
+    minConfidence = 0.45
   ): Promise<DetectedEntity[]> {
     try {
-      const model = await this.loadCocoModel();
-      if (!model) return [];
-
-      const predictions = await model.detect(sourceElement);
       const width = sourceElement instanceof HTMLVideoElement ? sourceElement.videoWidth : sourceElement.width;
       const height = sourceElement instanceof HTMLVideoElement ? sourceElement.videoHeight : sourceElement.height;
 
       if (!width || !height) return [];
 
-      const detectedEntities: DetectedEntity[] = predictions
-        .filter((p: any) => p.score >= minConfidence)
-        .map((p: any, idx: number) => {
+      const now = performance.now();
+      let rawDetections: Array<{
+        class: string;
+        score: number;
+        bbox: [number, number, number, number]; // [px, py, pw, ph]
+      }> = [];
+
+      // 1. Try Coco-SSD Neural Network
+      let model = this.cocoModel;
+      if (!model && !this.isLoadingModel && !this.modelLoadPromise) {
+        this.loadCocoModel();
+      }
+
+      if (model) {
+        try {
+          const preds = await model.detect(sourceElement, 10, minConfidence);
+          if (Array.isArray(preds)) {
+            rawDetections = preds.map(p => ({
+              class: p.class,
+              score: p.score,
+              bbox: p.bbox
+            }));
+          }
+        } catch (predErr) {
+          console.warn('Coco-SSD inference notice:', predErr);
+        }
+      }
+
+      // 2. Optical Vision Fallback: If neural model is downloading or returned empty while camera is moving,
+      // run rapid optical foreground/contrast clustering to detect visible objects directly from pixels
+      if (rawDetections.length === 0 && (!model || this.isLoadingModel)) {
+        rawDetections = this.detectOpticalObjects(sourceElement, width, height, minConfidence);
+      }
+
+      // 3. Map detected objects to clinical spatial entities
+      const currentFrameTracked = new Map<string, typeof DetectionEngineService.trackedEntities extends Map<any, infer V> ? V : never>();
+
+      const detectedEntities: DetectedEntity[] = rawDetections
+        .filter(p => p.score >= minConfidence)
+        .map((p) => {
           const [px, py, pw, ph] = p.bbox;
           const bbox: BoundingBox = {
-            x: Math.max(0, px / width),
-            y: Math.max(0, py / height),
-            width: Math.min(1, pw / width),
-            height: Math.min(1, ph / height)
+            x: Math.max(0, Math.min(0.98, px / width)),
+            y: Math.max(0, Math.min(0.98, py / height)),
+            width: Math.max(0.04, Math.min(1.0, pw / width)),
+            height: Math.max(0.04, Math.min(1.0, ph / height))
           };
 
-          // Map Coco-SSD classes to our medical/spatial categories
+          // Map Coco-SSD classes to clinical/spatial categories
           let category: ObjectCategory = 'obstacle';
-          const rawClass = (p.class || '').toLowerCase();
+          const rawClass = (p.class || '').toLowerCase().trim();
           if (rawClass.includes('person')) category = 'person';
-          else if (rawClass.includes('car') || rawClass.includes('truck') || rawClass.includes('bus')) category = 'car';
-          else if (rawClass.includes('bench') || rawClass.includes('chair') || rawClass.includes('couch')) category = 'bench';
-          else if (rawClass.includes('potted plant') || rawClass.includes('tree')) category = 'tree';
-          else if (rawClass.includes('dog') || rawClass.includes('cat')) category = 'dog';
+          else if (rawClass.includes('car') || rawClass.includes('truck') || rawClass.includes('bus') || rawClass.includes('motorcycle') || rawClass.includes('bicycle')) category = 'car';
+          else if (rawClass.includes('bench') || rawClass.includes('chair') || rawClass.includes('couch') || rawClass.includes('bed')) category = 'bench';
+          else if (rawClass.includes('plant') || rawClass.includes('tree')) category = 'tree';
+          else if (rawClass.includes('dog') || rawClass.includes('cat') || rawClass.includes('bird') || rawClass.includes('animal')) category = 'dog';
+          else if (rawClass.includes('door')) category = 'doorway';
+          else if (rawClass.includes('stair') || rawClass.includes('step')) category = 'steps';
+          else category = 'obstacle';
 
-          const spatial = SpatialMapperService.calculateSpatialCoordinates(bbox, category, 'stationary');
+          // Format clean display label
+          const cleanLabel = p.class
+            ? p.class.charAt(0).toUpperCase() + p.class.slice(1)
+            : 'Target';
+
+          // Match with existing tracked entities to provide smooth temporal stability
+          let matchedTrackId: string | null = null;
+          let bestDist = 0.28; // centroid distance threshold in normalized coords
+          const currentCenterX = bbox.x + bbox.width / 2;
+          const currentCenterY = bbox.y + bbox.height / 2;
+
+          for (const [tId, tracked] of this.trackedEntities.entries()) {
+            if (tracked.category === category || tracked.label.toLowerCase() === rawClass) {
+              const prevCenterX = tracked.prevBbox.x + tracked.prevBbox.width / 2;
+              const prevCenterY = tracked.prevBbox.y + tracked.prevBbox.height / 2;
+              const d = Math.hypot(currentCenterX - prevCenterX, currentCenterY - prevCenterY);
+              if (d < bestDist) {
+                bestDist = d;
+                matchedTrackId = tId;
+              }
+            }
+          }
+
+          let entityId: string;
+          let movement: MovementType = 'stationary';
+          let velocityMps = 0.0;
+          let smoothedBbox = bbox;
+
+          if (matchedTrackId && this.trackedEntities.has(matchedTrackId)) {
+            const prev = this.trackedEntities.get(matchedTrackId)!;
+            entityId = prev.id;
+
+            // Slight exponential smoothing to prevent subpixel camera sensor noise
+            smoothedBbox = {
+              x: Number((prev.prevBbox.x * 0.25 + bbox.x * 0.75).toFixed(3)),
+              y: Number((prev.prevBbox.y * 0.25 + bbox.y * 0.75).toFixed(3)),
+              width: Number((prev.prevBbox.width * 0.25 + bbox.width * 0.75).toFixed(3)),
+              height: Number((prev.prevBbox.height * 0.25 + bbox.height * 0.75).toFixed(3))
+            };
+
+            const dt = Math.max(0.016, (now - prev.lastTime) / 1000);
+            const deltaH = smoothedBbox.height - prev.prevBbox.height;
+            const deltaX = (smoothedBbox.x + smoothedBbox.width / 2) - (prev.prevBbox.x + prev.prevBbox.width / 2);
+
+            if (deltaH > 0.035) {
+              movement = 'approaching';
+              velocityMps = Number(Math.min(2.5, Math.abs(deltaH * 4 / dt)).toFixed(1));
+            } else if (deltaH < -0.035) {
+              movement = 'receding';
+              velocityMps = Number(Math.min(2.5, Math.abs(deltaH * 4 / dt)).toFixed(1));
+            } else if (Math.abs(deltaX) > 0.04) {
+              movement = deltaX > 0 ? 'crossing-right' : 'crossing-left';
+              velocityMps = Number(Math.min(2.0, Math.abs(deltaX * 3 / dt)).toFixed(1));
+            } else {
+              movement = 'stationary';
+              velocityMps = 0.0;
+            }
+          } else {
+            // New target entered camera field of view
+            entityId = `target-${this.nextTrackId++}`;
+          }
+
+          // Calculate calibrated spatial perspective metrics
+          const spatial = SpatialMapperService.calculateSpatialCoordinates(
+            smoothedBbox,
+            category,
+            movement,
+            rawClass
+          );
+
+          // Save tracking state for next frame
+          currentFrameTracked.set(entityId, {
+            id: entityId,
+            label: cleanLabel,
+            category,
+            prevBbox: smoothedBbox,
+            prevDist: spatial.distanceMeters,
+            lastTime: now,
+            velocityMps,
+            movement
+          });
 
           return {
-            id: `det-live-${idx}-${Date.now() % 1000}`,
-            label: `${p.class.charAt(0).toUpperCase() + p.class.slice(1)}`,
+            id: entityId,
+            label: cleanLabel,
             category,
             confidence: Number(p.score.toFixed(2)),
-            bbox,
+            bbox: smoothedBbox,
             distanceMeters: spatial.distanceMeters,
             azimuthDegrees: spatial.azimuthDegrees,
             elevationDegrees: spatial.elevationDegrees,
             direction: spatial.direction,
             relativePositionText: spatial.relativePositionText,
-            movement: 'stationary' as MovementType,
-            velocityMps: 0.0,
+            movement,
+            velocityMps,
             trajectoryVector: { dx: 0, dy: 0 },
             hazardLevel: spatial.hazardLevel,
             timeToCollisionSec: spatial.timeToCollisionSec,
@@ -101,9 +234,92 @@ export class DetectionEngineService {
           };
         });
 
+      // Crucial: Drop tracked objects that are no longer in the camera view
+      this.trackedEntities = currentFrameTracked;
+
       return detectedEntities;
     } catch (e) {
       console.error('Detection frame error:', e);
+      return [];
+    }
+  }
+
+  /**
+   * Fast optical foreground/saliency analyzer for real-time camera frames
+   * Used as instantaneous fallback if neural model is downloading or offline
+   */
+  private static detectOpticalObjects(
+    sourceElement: HTMLVideoElement | HTMLCanvasElement,
+    srcWidth: number,
+    srcHeight: number,
+    minConfidence: number
+  ): Array<{ class: string; score: number; bbox: [number, number, number, number] }> {
+    try {
+      const sw = 160;
+      const sh = 120;
+      if (!this.offscreenCanvas) {
+        this.offscreenCanvas = document.createElement('canvas');
+        this.offscreenCanvas.width = sw;
+        this.offscreenCanvas.height = sh;
+        this.offscreenCtx = this.offscreenCanvas.getContext('2d', { willReadFrequently: true });
+      }
+
+      if (!this.offscreenCtx) return [];
+
+      this.offscreenCtx.drawImage(sourceElement, 0, 0, sw, sh);
+      const imgData = this.offscreenCtx.getImageData(0, 0, sw, sh);
+      const data = imgData.data;
+
+      // Detect prominent foreground clusters via edge & contrast difference
+      let minX = sw, maxX = 0, minY = sh, maxY = 0;
+      let foregroundCount = 0;
+      let totalLuminance = 0;
+
+      // Sample luminance
+      for (let i = 0; i < data.length; i += 16) {
+        totalLuminance += (data[i] * 299 + data[i + 1] * 587 + data[i + 2] * 114) / 1000;
+      }
+      const avgLum = totalLuminance / (data.length / 16);
+
+      // Identify high contrast or moving foreground pixels
+      for (let y = 10; y < sh - 10; y += 2) {
+        for (let x = 10; x < sw - 10; x += 2) {
+          const idx = (y * sw + x) * 4;
+          const lum = (data[idx] * 299 + data[idx + 1] * 587 + data[idx + 2] * 114) / 1000;
+          const diff = Math.abs(lum - avgLum);
+
+          if (diff > 42) {
+            foregroundCount++;
+            if (x < minX) minX = x;
+            if (x > maxX) maxX = x;
+            if (y < minY) minY = y;
+            if (y > maxY) maxY = y;
+          }
+        }
+      }
+
+      // Check if cluster is significant (not pure noise)
+      const clusterArea = (maxX - minX) * (maxY - minY);
+      if (foregroundCount > 70 && clusterArea > 400 && maxX > minX + 16 && maxY > minY + 16) {
+        const clusterW = (maxX - minX) / sw;
+        const clusterH = (maxY - minY) / sh;
+        const clusterX = minX / sw;
+        const clusterY = minY / sh;
+
+        // Classify based on optical aspect ratio
+        const aspect = clusterH / Math.max(0.01, clusterW);
+        const objectClass = aspect > 1.3 ? 'person' : (clusterW > 0.45 ? 'obstacle' : 'object');
+        const score = Math.min(0.88, Math.max(minConfidence, 0.55 + (foregroundCount / 1200)));
+
+        return [{
+          class: objectClass,
+          score,
+          bbox: [clusterX * srcWidth, clusterY * srcHeight, clusterW * srcWidth, clusterH * srcHeight]
+        }];
+      }
+
+      return [];
+    } catch {
       return [];
     }
   }

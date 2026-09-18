@@ -10,7 +10,8 @@ export class SpatialMapperService {
   public static calculateSpatialCoordinates(
     bbox: BoundingBox,
     category: ObjectCategory,
-    movement: MovementType = 'stationary'
+    movement: MovementType = 'stationary',
+    specificClass?: string
   ): {
     distanceMeters: number;
     azimuthDegrees: number;
@@ -43,7 +44,6 @@ export class SpatialMapperService {
     else direction = 'far-right';
 
     // Physical reference heights & dimensions (in meters)
-    // Based on standard anthropometric and architectural benchmarks
     const referenceDimensions: Record<ObjectCategory, { height: number; width: number }> = {
       person: { height: 1.70, width: 0.50 },
       car: { height: 1.50, width: 1.80 },
@@ -57,7 +57,37 @@ export class SpatialMapperService {
       cyclist: { height: 1.55, width: 0.60 }
     };
 
-    const prior = referenceDimensions[category] || referenceDimensions.obstacle;
+    const specificDimensions: Record<string, { height: number; width: number }> = {
+      'cell phone': { height: 0.15, width: 0.08 },
+      'cup': { height: 0.12, width: 0.10 },
+      'bottle': { height: 0.24, width: 0.08 },
+      'wine glass': { height: 0.20, width: 0.08 },
+      'bowl': { height: 0.10, width: 0.16 },
+      'book': { height: 0.24, width: 0.18 },
+      'laptop': { height: 0.25, width: 0.35 },
+      'mouse': { height: 0.05, width: 0.10 },
+      'keyboard': { height: 0.12, width: 0.42 },
+      'remote': { height: 0.18, width: 0.05 },
+      'backpack': { height: 0.45, width: 0.32 },
+      'handbag': { height: 0.30, width: 0.35 },
+      'suitcase': { height: 0.65, width: 0.45 },
+      'chair': { height: 0.85, width: 0.55 },
+      'couch': { height: 0.80, width: 1.60 },
+      'bed': { height: 0.70, width: 1.60 },
+      'dining table': { height: 0.75, width: 1.20 },
+      'tv': { height: 0.50, width: 0.85 },
+      'cat': { height: 0.28, width: 0.45 },
+      'dog': { height: 0.55, width: 0.70 },
+      'bird': { height: 0.20, width: 0.25 },
+      'potted plant': { height: 0.45, width: 0.35 },
+      'clock': { height: 0.28, width: 0.28 },
+      'scissors': { height: 0.18, width: 0.08 }
+    };
+
+    const rawLower = (specificClass || '').toLowerCase().trim();
+    const prior = (rawLower && specificDimensions[rawLower])
+      ? specificDimensions[rawLower]
+      : (referenceDimensions[category] || referenceDimensions.obstacle);
 
     // 1. Pinhole Optical Projection Model:
     // Focal length fy in normalized screen height units for a 50° vertical FOV:
@@ -68,7 +98,6 @@ export class SpatialMapperService {
 
     // 2. Ground-Plane Contact Perspective Model:
     // Assuming standard user perspective height h_cam ≈ 1.30m with a gentle 6° pitch downward tilt:
-    // Objects contacting the ground lower on the screen (bottomY closer to 1.0) are nearer.
     const hCam = 1.30;
     const tiltRad = (6 * Math.PI) / 180;
     const pitchRad = Math.atan((bottomY - 0.5) / fy);
@@ -76,10 +105,13 @@ export class SpatialMapperService {
     const groundPlaneDistance = hCam / Math.tan(totalAngle);
 
     // 3. Calibrated Multi-Cues Depth Fusion:
-    // For close-up objects (occupying large height), optical height is very reliable.
-    // For ground obstacles (steps, tables, chairs), ground-plane contact gives stable bounds.
+    // Handheld or tabletop items rely purely on optical size
+    const isHandheldOrSmall = ['cell phone', 'cup', 'bottle', 'wine glass', 'bowl', 'book', 'mouse', 'remote', 'scissors', 'laptop', 'keyboard'].includes(rawLower);
+
     let fusedDistance: number;
-    if (category === 'steps' || category === 'bench') {
+    if (isHandheldOrSmall) {
+      fusedDistance = opticalDistance;
+    } else if (category === 'steps' || category === 'bench') {
       fusedDistance = groundPlaneDistance * 0.7 + opticalDistance * 0.3;
     } else if (category === 'person' || category === 'doorway') {
       fusedDistance = opticalDistance * 0.65 + groundPlaneDistance * 0.35;
@@ -87,8 +119,8 @@ export class SpatialMapperService {
       fusedDistance = opticalDistance * 0.5 + groundPlaneDistance * 0.5;
     }
 
-    // Clamp to realistic sensor field depth (0.35m to 7.0m)
-    fusedDistance = Math.max(0.35, Math.min(7.0, fusedDistance));
+    // Clamp to realistic sensor field depth (0.25m to 7.0m)
+    fusedDistance = Math.max(0.25, Math.min(7.0, fusedDistance));
     // Calibrated round (2 decimals if <1m, 1 decimal if >=1m)
     const distanceMeters = fusedDistance < 1.0 
       ? Number(fusedDistance.toFixed(2))
